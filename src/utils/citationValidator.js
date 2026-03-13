@@ -2,14 +2,15 @@ import Cite from 'citation-js';
 
 // Comprehensive citation validator checking details (Authors, Year, Vol, Pages)
 
-export async function validateCitations(citations) {
-    const ncbiKey = import.meta.env.VITE_NCBI_API_KEY;
-    const elsevierKey = import.meta.env.VITE_ELSEVIER_API_KEY;
+export async function validateCitations(citations, apiKeys = {}) {
+    const ncbiKey = apiKeys.ncbi;
+    const elsevierKey = apiKeys.elsevier;
 
     const NCBI_URL = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi';
     const SCOPUS_URL = 'https://api.elsevier.com/content/search/scopus';
 
     const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+    const TITLE_SIM_THRESHOLD = 0.85;
 
     const validatedResults = [];
 
@@ -27,6 +28,7 @@ export async function validateCitations(citations) {
         if (item.doi) { idType = 'doi'; idValue = item.doi; }
         else if (item.pmid) { idType = 'pmid'; idValue = item.pmid; }
         else if (item.pmcid) { idType = 'pmcid'; idValue = item.pmcid; }
+        else if (item.original?.startsWith('http')) { idType = 'url'; idValue = item.original; }
 
         // A. STRATEGY 1: Resolve by Provided ID
         if (idValue) {
@@ -40,6 +42,7 @@ export async function validateCitations(citations) {
                         authors: data.author ? data.author.map(a => `${a.given || ''} ${a.family || ''}`.trim()) : [],
                         year: data.issued?.['date-parts']?.[0]?.[0]?.toString(),
                         volume: data.volume?.toString(),
+                        issue: data.issue?.toString(),
                         pages: data.page?.toString(),
                         doi: data.DOI || idValue
                     };
@@ -48,8 +51,54 @@ export async function validateCitations(citations) {
                     correctedBibtex = cite.format('bibtex', { format: 'text' });
                 }
             } catch (e) {
-                console.warn("Checking provided ID failed, falling back to Title Search", e);
-                idValue = null; // Reset to trigger title search
+                console.warn(`[Strategy A] Cite.async failed for "${idValue}":`, e.message);
+                // Fallback: NCBI esummary for PubMed URLs
+                const pmidFromUrl = idValue?.match(/pubmed\.ncbi\.nlm\.nih\.gov\/(\d+)/)?.[1];
+                if (pmidFromUrl) {
+                    try {
+                        const params = new URLSearchParams({ db: 'pubmed', id: pmidFromUrl, retmode: 'json' });
+                        if (ncbiKey) params.append('api_key', ncbiKey);
+                        const res = await fetch(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?${params}`);
+                        if (res.ok) {
+                            const ncbiData = await res.json();
+                            const r = ncbiData.result?.[pmidFromUrl];
+                            if (r && !r.error && r.title) {
+                                const doi = r.elocationid?.replace('doi: ', '').trim() || null;
+                                trueData = {
+                                    title: r.title,
+                                    journal: r.fulljournalname || r.source,
+                                    authors: (r.authors || []).map(a => a.name),
+                                    year: r.pubdate?.split(' ')?.[0],
+                                    volume: r.volume,
+                                    issue: r.issue,
+                                    pages: r.pages,
+                                    doi
+                                };
+                                status = 'valid';
+                                sources.push('NCBI');
+                                const authorKey = trueData.authors[0]?.split(' ').pop() || 'unknown';
+                                const citeKey = `${authorKey}${trueData.year || ''}`;
+                                correctedBibtex = `@article{${citeKey},\n  author = {${trueData.authors.join(' and ')}},\n  title = {${trueData.title}},\n  journal = {${trueData.journal}},\n  year = {${trueData.year || ''}},\n  volume = {${trueData.volume || ''}},\n  pages = {${trueData.pages || ''}}${doi ? `,\n  doi = {${doi}}` : ''}\n}`;
+                            }
+                        }
+                    } catch (e2) {
+                        console.warn('[Strategy A NCBI fallback] failed:', e2.message);
+                    }
+                }
+                if (!trueData) idValue = null;
+            }
+        }
+
+        // A-check. URL MISMATCH DETECTION: if resolved title doesn't match extracted title,
+        // the URL/DOI likely points to the wrong article — discard and fall through to title search
+        if (trueData && item.title) {
+            const sim = titleSimilarity(item.title, trueData.title || '');
+            if (sim < 0.5) {
+                console.warn('[URL mismatch] title sim:', sim.toFixed(2), '| extracted:', item.title, '| resolved:', trueData.title);
+                mismatchDetails.push(`URL points to wrong article: resolved "${trueData.title}"`);
+                trueData = null;
+                correctedBibtex = null;
+                status = 'invalid';
             }
         }
 
@@ -88,16 +137,20 @@ export async function validateCitations(citations) {
                             const total = parseInt(data['search-results']?.['opensearch:totalResults']);
                             if (total > 0) {
                                 const entries = data['search-results'].entry;
-                                // Find exact title match
-                                const exactMatch = entries.find(e => normalize(e['dc:title']) === normalize(cleanedTitle));
-                                const result = exactMatch || entries[0]; // Prefer exact
+                                // Find best title match using fuzzy similarity
+                                let bestSC = null, bestSCSim = 0;
+                                for (const e of entries) {
+                                    const sim = titleSimilarity(e['dc:title'], cleanedTitle);
+                                    if (sim > bestSCSim) { bestSCSim = sim; bestSC = e; }
+                                }
+                                const result = bestSCSim >= TITLE_SIM_THRESHOLD ? bestSC : null;
 
                                 if (result) {
                                     foundSource = 'Scopus';
                                     if (result['prism:doi']) foundId = result['prism:doi'];
-                                    // If Scopus found it but no DOI, we typically can't use citation-js well. 
+                                    // If Scopus found it but no DOI, we typically can't use citation-js well.
                                     // But we can construct partial trueData from Scopus result directly?
-                                    // For consistency, let's try to get an ID. 
+                                    // For consistency, let's try to get an ID.
                                     // If no DOI, we might need to rely on Scopus metadata directly.
                                     if (!foundId) {
                                         // Construct TrueData directly from Scopus result
@@ -107,6 +160,7 @@ export async function validateCitations(citations) {
                                             authors: [result['dc:creator']], // Scopus often only gives first author or creator string
                                             year: result['prism:coverDate']?.substring(0, 4),
                                             volume: result['prism:volume'],
+                                            issue: result['prism:issueIdentifier'],
                                             pages: result['prism:pageRange'],
                                             doi: null
                                         };
@@ -119,7 +173,64 @@ export async function validateCitations(citations) {
                     } catch (e) {/*ignore*/ }
                 }
 
-                // 3. Resolve Found ID
+                // 3. CrossRef Title Search (free, no key needed — covers CS/engineering/social science)
+                if (!foundId && !trueData) {
+                    try {
+                        const res = await fetch(
+                            `https://api.crossref.org/works?query.title=${encodeURIComponent(cleanedTitle)}&rows=10&select=DOI,title`
+                        );
+                        if (res.ok) {
+                            const data = await res.json();
+                            const items = data.message?.items || [];
+                            let bestCR = null, bestCRSim = 0;
+                            for (const it of items) {
+                                const sim = titleSimilarity(it.title?.[0], cleanedTitle);
+                                if (sim > bestCRSim) { bestCRSim = sim; bestCR = it; }
+                            }
+                            if (bestCRSim >= TITLE_SIM_THRESHOLD && bestCR?.DOI) {
+                                foundId = bestCR.DOI;
+                                foundSource = 'CrossRef';
+                            }
+                        }
+                    } catch (e) { console.warn('[CrossRef] failed:', e); }
+                }
+
+                // 4. Semantic Scholar Title Search (CORS-enabled; indexes arXiv + CS papers)
+                if (!foundId && !trueData) {
+                    try {
+                        const ssRes = await fetch(
+                            `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(cleanedTitle)}&fields=title,authors,year,externalIds,venue&limit=5`
+                        );
+                        if (ssRes.ok) {
+                            const ssData = await ssRes.json();
+                            const papers = ssData.data || [];
+                            let bestPaper = null, bestSim = 0;
+                            for (const p of papers) {
+                                const sim = titleSimilarity(p.title, cleanedTitle);
+                                if (sim > bestSim) { bestSim = sim; bestPaper = p; }
+                            }
+                            if (bestSim >= TITLE_SIM_THRESHOLD && bestPaper) {
+                                const arxivId = bestPaper.externalIds?.ArXiv || null;
+                                const doi = bestPaper.externalIds?.DOI || (arxivId ? `10.48550/arXiv.${arxivId}` : null);
+                                const authors = (bestPaper.authors || []).map(a => a.name);
+                                const year = bestPaper.year?.toString();
+                                const title = bestPaper.title;
+                                const venue = bestPaper.venue || (arxivId ? 'arXiv' : null);
+                                trueData = { title, journal: venue, authors, year, volume: null, issue: null, pages: null, doi };
+                                status = 'valid';
+                                sources.push(arxivId ? 'arXiv' : 'Semantic Scholar');
+                                const authorKey = authors[0]?.split(/[,\s]+/)?.pop() || 'unknown';
+                                if (arxivId) {
+                                    correctedBibtex = `@misc{${authorKey}${year || ''},\n  author = {${authors.join(' and ')}},\n  title = {${title || ''}},\n  year = {${year || ''}},\n  eprint = {${arxivId}},\n  archivePrefix = {arXiv}${doi ? `,\n  doi = {${doi}}` : ''}\n}`;
+                                } else {
+                                    correctedBibtex = `@article{${authorKey}${year || ''},\n  author = {${authors.join(' and ')}},\n  title = {${title || ''}},\n  journal = {${venue || ''}},\n  year = {${year || ''}}${doi ? `,\n  doi = {${doi}}` : ''}\n}`;
+                                }
+                            }
+                        }
+                    } catch (e) { console.warn('[Semantic Scholar] failed:', e.message); }
+                }
+
+                // 5. Resolve Found ID
                 if (foundId && !trueData) { // Only resolve if an ID was found and trueData wasn't already set by Scopus
                     try {
                         const cite = await Cite.async(foundId);
@@ -131,15 +242,77 @@ export async function validateCitations(citations) {
                                 authors: data.author ? data.author.map(a => `${a.given || ''} ${a.family || ''}`.trim()) : [],
                                 year: data.issued?.['date-parts']?.[0]?.[0]?.toString(),
                                 volume: data.volume?.toString(),
+                                issue: data.issue?.toString(),
                                 pages: data.page?.toString(),
                                 doi: data.DOI || foundId
                             };
                             status = 'valid';
                             sources.push(foundSource);
-                            // Helper: updated bibtex from this true data
                             correctedBibtex = cite.format('bibtex', { format: 'text' });
                         }
-                    } catch (e) { console.warn("Fetch failed for found ID", e); }
+                    } catch (e) {
+                        console.warn("Cite.async failed:", e.message, "| foundId:", foundId);
+                        // Fallback A: NCBI esummary for bare PMIDs (numeric strings)
+                        if (typeof foundId === 'string' && /^\d+$/.test(foundId)) {
+                            try {
+                                const params = new URLSearchParams({ db: 'pubmed', id: foundId, retmode: 'json' });
+                                if (ncbiKey) params.append('api_key', ncbiKey);
+                                const res = await fetch(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?${params}`);
+                                if (res.ok) {
+                                    const ncbiData = await res.json();
+                                    const r = ncbiData.result?.[foundId];
+                                    if (r && !r.error && r.title) {
+                                        const doi = r.elocationid?.replace('doi: ', '').trim() || null;
+                                        const authors = (r.authors || []).map(a => a.name);
+                                        const year = r.pubdate?.split(' ')?.[0];
+                                        trueData = {
+                                            title: r.title,
+                                            journal: r.fulljournalname || r.source,
+                                            authors, year,
+                                            volume: r.volume,
+                                            issue: r.issue,
+                                            pages: r.pages,
+                                            doi
+                                        };
+                                        status = 'valid';
+                                        sources.push('NCBI');
+                                        const authorKey = authors[0]?.split(' ').pop() || 'unknown';
+                                        correctedBibtex = `@article{${authorKey}${year || ''},\n  author = {${authors.join(' and ')}},\n  title = {${trueData.title}},\n  journal = {${trueData.journal || ''}},\n  year = {${year || ''}},\n  volume = {${trueData.volume || ''}},\n  pages = {${trueData.pages || ''}}${doi ? `,\n  doi = {${doi}}` : ''}\n}`;
+                                    }
+                                }
+                            } catch (e2) { console.warn('[NCBI esummary fallback] failed:', e2.message); }
+                        }
+                        // Fallback B: CrossRef direct API for DOIs (bypasses citation-js)
+                        if (!trueData && typeof foundId === 'string' && foundId.startsWith('10.')) {
+                            try {
+                                // DOI slashes must NOT be percent-encoded in the URL path
+                                const crRes = await fetch(`https://api.crossref.org/works/${foundId}`);
+                                if (crRes.ok) {
+                                    const crJson = await crRes.json();
+                                    const w = crJson.message;
+                                    if (w?.title?.[0]) {
+                                        const authors = (w.author || []).map(a => `${a.given || ''} ${a.family || ''}`.trim());
+                                        const year = w.issued?.['date-parts']?.[0]?.[0]?.toString()
+                                            || w['published-online']?.['date-parts']?.[0]?.[0]?.toString();
+                                        trueData = {
+                                            title: w.title[0],
+                                            journal: w['container-title']?.[0],
+                                            authors,
+                                            year,
+                                            volume: w.volume?.toString(),
+                                            issue: w.issue?.toString(),
+                                            pages: w.page?.toString(),
+                                            doi: w.DOI
+                                        };
+                                        status = 'valid';
+                                        sources.push(foundSource || 'CrossRef');
+                                        const authorKey = authors[0]?.split(' ').pop() || 'unknown';
+                                        correctedBibtex = `@article{${authorKey}${year || ''},\n  author = {${authors.join(' and ')}},\n  title = {${trueData.title}},\n  journal = {${trueData.journal || ''}},\n  year = {${year || ''}},\n  volume = {${trueData.volume || ''}},\n  pages = {${trueData.pages || ''}}${trueData.doi ? `,\n  doi = {${trueData.doi}}` : ''}\n}`;
+                                    }
+                                }
+                            } catch (e2) { console.warn('[CrossRef direct] failed:', e2.message); }
+                        }
+                    }
                 }
             }
         }
@@ -160,20 +333,37 @@ export async function validateCitations(citations) {
             };
 
             // 1. Journal
-            const genJournal = normalize(item.extracted_journal);
-            const refJournal = normalize(trueData.journal);
+            const normalizeJournal = s => normalize(s?.replace(/&/g, 'and') || '');
+            const genJournal = normalizeJournal(item.extracted_journal);
+            const refJournal = normalizeJournal(trueData.journal);
             if (genJournal && refJournal && !stringsMatch(genJournal, refJournal)) {
                 isHallucinated = true;
                 mismatchDetails.push(`Journal: "${item.extracted_journal}" vs "${trueData.journal}"`);
             }
 
             // 2. Authors
-            const genAuthors = (item.extracted_authors || []).map(normalize);
-            const refAuthors = (trueData.authors || []).map(normalize);
+            const genAuthors = item.extracted_authors || [];
+            const refAuthors = trueData.authors || [];
             if (genAuthors.length > 0 && refAuthors.length > 0) {
-                if (!stringsMatch(genAuthors[0], refAuthors[0]) && !refAuthors.some(ra => stringsMatch(genAuthors[0], ra))) {
+                // a. Check first 3 authors
+                const checkCount = Math.min(3, genAuthors.length, refAuthors.length);
+                for (let i = 0; i < checkCount; i++) {
+                    if (!authorNamesMatch(genAuthors[i], refAuthors[i])) {
+                        isHallucinated = true;
+                        mismatchDetails.push(`Author ${i + 1} mismatch.`);
+                    }
+                }
+                // b. Check last author (only meaningful when 4+ authors, otherwise already covered)
+                if (genAuthors.length >= 4 && refAuthors.length >= 4) {
+                    if (!authorNamesMatch(genAuthors.at(-1), refAuthors.at(-1))) {
+                        isHallucinated = true;
+                        mismatchDetails.push(`Last author mismatch.`);
+                    }
+                }
+                // c. Check count: flag if LLM listed MORE authors than actually exist
+                if (genAuthors.length > refAuthors.length) {
                     isHallucinated = true;
-                    mismatchDetails.push(`Authors mismatch.`);
+                    mismatchDetails.push(`Author count: extracted ${genAuthors.length}, actual ${refAuthors.length}.`);
                 }
             }
 
@@ -196,13 +386,33 @@ export async function validateCitations(citations) {
             status, // 'valid', 'corrected', 'invalid'
             sources,
             bibtex: (status === 'corrected' && correctedBibtex) ? correctedBibtex : item.bibtex,
-            mismatchDetails
+            mismatchDetails,
+            resolvedData: trueData
         });
 
         await delay(200);
     }
 
     return validatedResults;
+}
+
+function authorNamesMatch(a, b) {
+    if (!a || !b) return false;
+    // Split into tokens, exclude single-char initials (e.g. "L", "B")
+    const tokens = str => str.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(t => t.length > 1);
+    const ta = tokens(a), tb = tokens(b);
+    if (ta.length === 0 || tb.length === 0) return false;
+    // Match if any meaningful token (family name) appears in both
+    return ta.some(t => tb.includes(t));
+}
+
+function titleSimilarity(a, b) {
+    if (!a || !b) return 0;
+    const tokens = s => new Set(s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean));
+    const ta = tokens(a), tb = tokens(b);
+    let inter = 0;
+    ta.forEach(t => { if (tb.has(t)) inter++; });
+    return inter / (ta.size + tb.size - inter);
 }
 
 function normalize(str) {
