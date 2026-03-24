@@ -1,0 +1,91 @@
+Literature2BibTeX 修改记录
+日期范围：2026-03-12 ~ 2026-03-23
+================================================================================
+
+--------------------------------------------------------------------------------
+2026-03-12 | feat: add multi-format citation output, download formats, and arXiv validation
+Commit: d0f8c47
+--------------------------------------------------------------------------------
+
+输出格式：
+- 新增 formatCitation.js，支持 9 种引用格式：
+  APA / MLA / Chicago / Vancouver / IEEE / AMA / AMJ / ACS / Harvard Gatton
+- 主界面新增格式切换按钮（BibTeX / APA / MLA / IEEE）+ Other 下拉菜单
+- 新增下载下拉菜单：BibTeX (.bib) / RIS (.ris) / NBIB (.nbib)
+
+引用验证：
+- 新增 Semantic Scholar API 作为第四路标题搜索源（支持 CORS，覆盖 arXiv）
+- 修复 CrossRef CORS 错误（移除被禁止的 User-Agent 请求头）
+- arXiv 预印本现可验证，生成带 eprint / archivePrefix 字段的 @misc BibTeX 条目
+
+--------------------------------------------------------------------------------
+2026-03-23 | feat: add Qwen/DeepSeek support, model fallback, and array field defense
+Commit: 2213339
+--------------------------------------------------------------------------------
+
+LLM 支持扩展：
+- bibtexConverter.js 引入 llmProviders.js + llmErrors.js
+- 新增 callGeminiModel(model 作参数) 和通用 callOpenAICompatModel
+- 实现同 provider 内模型自动回退链：
+    Gemini:   gemini-2.5-pro-preview-03-25 → gemini-1.5-pro → gemini-1.5-flash
+    OpenAI:   gpt-4o → gpt-4o-mini
+    Qwen:     qwen-plus → qwen-turbo
+    DeepSeek: deepseek-chat → deepseek-reasoner
+- 错误分类：Key/网络/限流错误立即停止；模型权限错误跳过重试下一个
+
+界面更新（App.jsx）：
+- 新增 Qwen（紫色）和 DeepSeek（青色）provider 切换按钮
+- apiKeys state 补充 qwen / deepseek（读写 localStorage）
+- API Keys 面板按选中 provider 动态显示对应输入框
+- 状态消息改为动态显示 provider 名称
+
+稳定性修复（citationValidator.js）：
+- 新增 toStr() 辅助函数，防御 LLM 将 extracted_journal / title 等字段返回为数组
+- Prompt 新增约束：All scalar fields must be strings or null, never arrays
+
+================================================================================
+
+--------------------------------------------------------------------------------
+2026-03-24 | fix: citation validation robustness improvements
+Commits: ad6aaff / ace1124 / 822f555
+--------------------------------------------------------------------------------
+
+预印本验证（citationValidator.js + 新增 deepSearch.js）：
+- 新增 Strategy C：Strategy A/B 均失败后，从原文扫描预印本 ID
+  支持 arXiv（arXiv:XXXX.XXXXX → DOI 10.48550/arXiv.XXXX）、bioRxiv/medRxiv、SSRN
+- 新建 deepSearch.js：带年份过滤的 CrossRef + Semantic Scholar 精确重搜，
+  对候选结果按年份匹配（+3/+1）和作者匹配（+2）打分，score ≥ 2 才采用
+
+同名文章误判修复（B-check）：
+- Strategy B 找到文章后，若年份差 > 2 且第一作者不匹配 → 触发 deep search（可能是同名不同文章）
+- 若年份差 > 2 但第一作者匹配 → 视为年份幻觉，直接进入 Compare Phase 正常标记
+- deep search 找到结果则更新 trueData；找不到则保持 invalid
+
+年份比较优化（Compare Phase）：
+- 年份差 ≤ 1 不标记为幻觉（兼容 online-first vs print 出版年差异）
+- BibTeX 输出改为：有 correctedBibtex 时始终采用数据库版本（即使 status = valid）
+
+其他修复：
+- et al. 结尾的引用跳过 last author 检查
+- LLM 回复数组字段防御：toStr() 覆盖 extracted_journal 和 title 两处 .replace() 调用
+
+================================================================================
+
+--------------------------------------------------------------------------------
+2026-03-24 | fix: journal/pages comparison robustness, Scopus BibTeX gap
+--------------------------------------------------------------------------------
+
+期刊名比较（citationValidator.js）：
+- journal 比较新增 titleSimilarity 兜底：stringsMatch 失败时，若 token 相似度 ≥ 0.7 则不报幻觉
+- 修复同一期刊历史名称（如 "Series B (Methodological)" vs "Series B: Statistical Methodology"）被误判的问题
+
+页码比较重写（citationValidator.js + 新增 normalizePageRange）：
+- 新增 normalizePageRange()：将 en-dash/em-dash 统一为连字符，展开 NCBI 缩写末页（577-80 → 577-580）
+- 提取值含范围（含 -）→ normalizePageRange 全量比较
+- 提取值为单页（无 -）→ 只比较起始页，避免 "289" vs "289-317" 误判
+
+Scopus 无 DOI 路径补全（citationValidator.js）：
+- Scopus 找到文章但无 DOI 时，原先 correctedBibtex 为 null，BibTeX 输出回退 LLM 原始值
+- 现效仿 NCBI 路径，手工构造 correctedBibtex
+
+================================================================================

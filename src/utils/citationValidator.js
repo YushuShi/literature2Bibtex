@@ -162,11 +162,13 @@ export async function validateCitations(citations, apiKeys = {}) {
                                     // If no DOI, we might need to rely on Scopus metadata directly.
                                     if (!foundId) {
                                         // Construct TrueData directly from Scopus result
+                                        const scopusAuthors = result['dc:creator'] ? [result['dc:creator']] : [];
+                                        const scopusYear = result['prism:coverDate']?.substring(0, 4);
                                         trueData = {
                                             title: result['dc:title'],
                                             journal: result['prism:publicationName'],
-                                            authors: [result['dc:creator']], // Scopus often only gives first author or creator string
-                                            year: result['prism:coverDate']?.substring(0, 4),
+                                            authors: scopusAuthors,
+                                            year: scopusYear,
                                             volume: result['prism:volume'],
                                             issue: result['prism:issueIdentifier'],
                                             pages: result['prism:pageRange'],
@@ -174,6 +176,9 @@ export async function validateCitations(citations, apiKeys = {}) {
                                         };
                                         status = 'valid';
                                         sources.push('Scopus');
+                                        const authorKey = scopusAuthors[0]?.split(' ').pop() || 'unknown';
+                                        const citeKey = `${authorKey}${scopusYear || ''}`;
+                                        correctedBibtex = `@article{${citeKey},\n  author = {${scopusAuthors.join(' and ')}},\n  title = {${trueData.title || ''}},\n  journal = {${trueData.journal || ''}},\n  year = {${scopusYear || ''}},\n  volume = {${trueData.volume || ''}},\n  pages = {${trueData.pages || ''}}\n}`;
                                     }
                                 }
                             }
@@ -420,7 +425,8 @@ export async function validateCitations(citations, apiKeys = {}) {
             const normalizeJournal = s => normalize(toStr(s).replace(/&/g, 'and'));
             const genJournal = normalizeJournal(item.extracted_journal);
             const refJournal = normalizeJournal(trueData.journal);
-            if (genJournal && refJournal && !stringsMatch(genJournal, refJournal)) {
+            if (genJournal && refJournal && !stringsMatch(genJournal, refJournal)
+                && titleSimilarity(toStr(item.extracted_journal), toStr(trueData.journal)) < 0.7) {
                 isHallucinated = true;
                 mismatchDetails.push(`Journal: "${item.extracted_journal}" vs "${trueData.journal}"`);
             }
@@ -462,7 +468,23 @@ export async function validateCitations(citations, apiKeys = {}) {
             checkMismatch(item.extracted_volume, trueData.volume, "Volume");
 
             // 5. Pages
-            checkMismatch(item.extracted_pages, trueData.pages, "Pages");
+            if (item.extracted_pages && trueData.pages) {
+                const extractedHasRange = /[–—-]/.test(item.extracted_pages);
+                if (extractedHasRange) {
+                    // Full range: normalize abbreviated end (e.g. "577-80" → "577-580")
+                    if (normalizePageRange(item.extracted_pages) !== normalizePageRange(trueData.pages)) {
+                        isHallucinated = true;
+                        mismatchDetails.push(`Pages: "${item.extracted_pages}" vs "${trueData.pages}"`);
+                    }
+                } else {
+                    // Single start page: only compare start pages
+                    const trueStart = trueData.pages.replace(/[–—-].*$/, '').trim();
+                    if (normalize(item.extracted_pages) !== normalize(trueStart)) {
+                        isHallucinated = true;
+                        mismatchDetails.push(`Pages: "${item.extracted_pages}" vs "${trueData.pages}"`);
+                    }
+                }
+            }
 
             if (isHallucinated) {
                 status = 'corrected';
@@ -511,4 +533,20 @@ function normalize(str) {
 function stringsMatch(s1, s2) {
     if (!s1 || !s2) return false;
     return s1.includes(s2) || s2.includes(s1);
+}
+
+function normalizePageRange(p) {
+    if (!p) return '';
+    // Normalize dashes (en-dash, em-dash → hyphen)
+    const s = p.replace(/[–—]/g, '-').trim();
+    const m = s.match(/^(\d+)-(\d+)$/);
+    if (m) {
+        const start = m[1], end = m[2];
+        // Expand abbreviated end: "577-80" → "577-580"
+        const expanded = end.length < start.length
+            ? start.slice(0, start.length - end.length) + end
+            : end;
+        return start + expanded;
+    }
+    return normalize(s);
 }
