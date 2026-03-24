@@ -33,6 +33,7 @@ export async function validateCitations(citations, apiKeys = {}) {
         else if (item.pmcid) { idType = 'pmcid'; idValue = item.pmcid; }
         else if (item.original?.startsWith('http')) { idType = 'url'; idValue = item.original; }
 
+
         // A. STRATEGY 1: Resolve by Provided ID
         if (idValue) {
             try {
@@ -316,6 +317,56 @@ export async function validateCitations(citations, apiKeys = {}) {
                             } catch (e2) { console.warn('[CrossRef direct] failed:', e2.message); }
                         }
                     }
+                }
+            }
+        }
+
+        // C. STRATEGY 3: Preprint ID Detection (arXiv, bioRxiv, medRxiv, SSRN)
+        if (!trueData) {
+            const orig = item.original || '';
+            const arxivMatch = orig.match(/arXiv[:\s]+(\d{4}\.\d{4,5})/i);
+            const biorxivMatch = orig.match(/(10\.1101\/[^\s,]+)/);
+            const ssrnMatch = orig.match(/ssrn\.com\/abstract[=\s]+(\d+)/i);
+
+            let preprintId = null;
+            let preprintSource = null;
+
+            if (arxivMatch) {
+                preprintId = `10.48550/arXiv.${arxivMatch[1]}`;
+                preprintSource = 'arXiv';
+            } else if (biorxivMatch) {
+                preprintId = biorxivMatch[1].replace(/[.,]+$/, '');
+                preprintSource = 'bioRxiv/medRxiv';
+            } else if (ssrnMatch) {
+                preprintId = `https://papers.ssrn.com/abstract=${ssrnMatch[1]}`;
+                preprintSource = 'SSRN';
+            }
+
+            if (preprintId) {
+                try {
+                    const cite = await Cite.async(preprintId);
+                    const data = cite.data[0];
+                    if (data) {
+                        const authors = data.author
+                            ? data.author.map(a => `${a.given || ''} ${a.family || ''}`.trim())
+                            : [];
+                        const year = data.issued?.['date-parts']?.[0]?.[0]?.toString();
+                        trueData = {
+                            title: data.title,
+                            journal: data['container-title'] || preprintSource,
+                            authors,
+                            year,
+                            volume: data.volume?.toString(),
+                            issue: data.issue?.toString(),
+                            pages: data.page?.toString(),
+                            doi: data.DOI || null
+                        };
+                        status = 'valid';
+                        sources.push(preprintSource);
+                        correctedBibtex = cite.format('bibtex', { format: 'text' });
+                    }
+                } catch (e) {
+                    console.warn(`[Preprint ${preprintSource}] failed for "${preprintId}":`, e.message);
                 }
             }
         }
