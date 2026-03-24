@@ -1,4 +1,5 @@
 import Cite from 'citation-js';
+import { deepSearchByTitle } from './deepSearch';
 
 // Comprehensive citation validator checking details (Authors, Year, Vol, Pages)
 
@@ -27,6 +28,7 @@ export async function validateCitations(citations, apiKeys = {}) {
         // --- 1. RESOLUTION PHASE: Try to get True Metadata ---
         let idType = null;
         let idValue = null;
+        let foundViaId = false;
 
         if (item.doi) { idType = 'doi'; idValue = item.doi; }
         else if (item.pmid) { idType = 'pmid'; idValue = item.pmid; }
@@ -51,6 +53,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                         doi: data.DOI || idValue
                     };
                     status = 'valid';
+                    foundViaId = true;
                     if (sources.length === 0) sources.push("CrossRef/Ref");
                     correctedBibtex = cite.format('bibtex', { format: 'text' });
                 }
@@ -79,6 +82,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                                     doi
                                 };
                                 status = 'valid';
+                                foundViaId = true;
                                 sources.push('NCBI');
                                 const authorKey = trueData.authors[0]?.split(' ').pop() || 'unknown';
                                 const citeKey = `${authorKey}${trueData.year || ''}`;
@@ -321,6 +325,32 @@ export async function validateCitations(citations, apiKeys = {}) {
             }
         }
 
+        // B-check: title-search result has year diff > 2
+        if (trueData && !foundViaId && item.extracted_year && trueData.year) {
+            if (Math.abs(parseInt(item.extracted_year) - parseInt(trueData.year)) > 2) {
+                const genFirstAuthor = (item.extracted_authors || [])[0];
+                const refFirstAuthor = (trueData.authors || [])[0];
+                const authorMatches = genFirstAuthor && refFirstAuthor && authorNamesMatch(genFirstAuthor, refFirstAuthor);
+
+                if (!authorMatches) {
+                    // Author mismatch → likely a different same-title paper → deep search with year filter
+                    const deepResult = await deepSearchByTitle(item.title, item.extracted_year, item.extracted_authors);
+                    if (deepResult) {
+                        trueData = deepResult.trueData;
+                        correctedBibtex = deepResult.correctedBibtex;
+                        sources = [deepResult.source];
+                        status = 'valid';
+                    } else {
+                        trueData = null;
+                        correctedBibtex = null;
+                        status = 'invalid';
+                        sources = [];
+                    }
+                }
+                // Author matches → same paper, year is hallucinated → fall through to Compare Phase
+            }
+        }
+
         // C. STRATEGY 3: Preprint ID Detection (arXiv, bioRxiv, medRxiv, SSRN)
         if (!trueData) {
             const orig = item.original || '';
@@ -422,8 +452,11 @@ export async function validateCitations(citations, apiKeys = {}) {
                 }
             }
 
-            // 3. Year
-            checkMismatch(item.extracted_year, trueData.year, "Year");
+            // 3. Year (1-year difference tolerated: online-first vs print)
+            if (item.extracted_year && trueData.year && Math.abs(parseInt(item.extracted_year) - parseInt(trueData.year)) > 1) {
+                isHallucinated = true;
+                mismatchDetails.push(`Year: "${item.extracted_year}" vs "${trueData.year}"`);
+            }
 
             // 4. Volume
             checkMismatch(item.extracted_volume, trueData.volume, "Volume");
@@ -440,7 +473,7 @@ export async function validateCitations(citations, apiKeys = {}) {
             ...item,
             status, // 'valid', 'corrected', 'invalid'
             sources,
-            bibtex: (status === 'corrected' && correctedBibtex) ? correctedBibtex : item.bibtex,
+            bibtex: correctedBibtex || item.bibtex,
             mismatchDetails,
             resolvedData: trueData
         });
