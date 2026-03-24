@@ -3,6 +3,7 @@ import { BookOpen, Copy, Download, RefreshCw, FileText, Check, AlertCircle, Aler
 import { convertToBibtex } from './utils/bibtexConverter';
 import { validateCitations } from './utils/citationValidator';
 import { formatCitation, FORMAT_LABELS, PRIMARY_FORMATS, OTHER_FORMATS, buildRIS, buildNBIB } from './utils/formatCitation';
+import { PROVIDERS } from './utils/llmProviders';
 
 function App() {
   const [input, setInput] = useState('');
@@ -19,6 +20,8 @@ function App() {
   const [apiKeys, setApiKeys] = useState(() => ({
     gemini: localStorage.getItem('apiKey_gemini') || '',
     openai: localStorage.getItem('apiKey_openai') || '',
+    qwen: localStorage.getItem('apiKey_qwen') || '',
+    deepseek: localStorage.getItem('apiKey_deepseek') || '',
     ncbi: localStorage.getItem('apiKey_ncbi') || '',
     elsevier: localStorage.getItem('apiKey_elsevier') || '',
   }));
@@ -34,7 +37,7 @@ function App() {
     setLoading(true);
     setError(null);
     setResults(null);
-    setStatusMessage(`Parsing citations with ${provider === 'gemini' ? 'Gemini' : 'OpenAI'}...`);
+    setStatusMessage(`Parsing citations with ${PROVIDERS[provider].name}...`);
 
     try {
       // 1. Convert to structured BibTeX objects
@@ -150,7 +153,19 @@ function App() {
                     onClick={() => setProvider('openai')}
                     className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${provider === 'openai' ? 'bg-emerald-600 text-white shadow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
                   >
-                    OpenAI GPT-4o
+                    OpenAI
+                  </button>
+                  <button
+                    onClick={() => setProvider('qwen')}
+                    className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${provider === 'qwen' ? 'bg-purple-600 text-white shadow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                  >
+                    Qwen
+                  </button>
+                  <button
+                    onClick={() => setProvider('deepseek')}
+                    className={`px-3 py-1 rounded-lg text-sm font-medium transition-colors ${provider === 'deepseek' ? 'bg-cyan-600 text-white shadow' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                  >
+                    DeepSeek
                   </button>
                 </div>
                 <button
@@ -165,7 +180,7 @@ function App() {
               {showApiSettings && (
                 <div className="mb-4 p-4 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-1 md:grid-cols-2 gap-3">
                   {/* Only show the key for the selected provider */}
-                  {provider === 'gemini' ? (
+                  {provider === 'gemini' && (
                     <div>
                       <label className="block text-xs font-medium text-slate-600 mb-1">
                         Gemini API Key <span className="text-red-400">*</span>
@@ -178,7 +193,8 @@ function App() {
                         className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
                       />
                     </div>
-                  ) : (
+                  )}
+                  {provider === 'openai' && (
                     <div>
                       <label className="block text-xs font-medium text-slate-600 mb-1">
                         OpenAI API Key <span className="text-red-400">*</span>
@@ -189,6 +205,34 @@ function App() {
                         onChange={e => handleApiKeyChange('openai', e.target.value)}
                         placeholder="sk-..."
                         className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      />
+                    </div>
+                  )}
+                  {provider === 'qwen' && (
+                    <div>
+                      <label className="block text-xs font-medium text-slate-600 mb-1">
+                        Qwen API Key <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="password"
+                        value={apiKeys.qwen}
+                        onChange={e => handleApiKeyChange('qwen', e.target.value)}
+                        placeholder="sk-..."
+                        className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-purple-500 focus:border-transparent outline-none"
+                      />
+                    </div>
+                  )}
+                  {provider === 'deepseek' && (
+                    <div>
+                      <label className="block text-xs font-medium text-slate-600 mb-1">
+                        DeepSeek API Key <span className="text-red-400">*</span>
+                      </label>
+                      <input
+                        type="password"
+                        value={apiKeys.deepseek}
+                        onChange={e => handleApiKeyChange('deepseek', e.target.value)}
+                        placeholder="sk-..."
+                        className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-cyan-500 focus:border-transparent outline-none"
                       />
                     </div>
                   )}
@@ -418,7 +462,7 @@ function App() {
 
         {/* Footer */}
         <div className="mt-8 text-center text-slate-400 text-sm">
-          <p>© {new Date().getFullYear()} Literature Check. Powered by Gemini / OpenAI, NCBI & Scopus.</p>
+          <p>© {new Date().getFullYear()} Literature Check. Powered by Gemini / OpenAI / Qwen / DeepSeek, NCBI & Scopus.</p>
         </div>
       </div>
     </div>

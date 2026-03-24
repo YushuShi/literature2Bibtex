@@ -2,6 +2,9 @@ import Cite from 'citation-js';
 
 // Comprehensive citation validator checking details (Authors, Year, Vol, Pages)
 
+// Safety: LLM may return arrays instead of strings for any field
+const toStr = v => Array.isArray(v) ? (v[0] ?? '') : (v ?? '');
+
 export async function validateCitations(citations, apiKeys = {}) {
     const ncbiKey = apiKeys.ncbi;
     const elsevierKey = apiKeys.elsevier;
@@ -104,7 +107,7 @@ export async function validateCitations(citations, apiKeys = {}) {
 
         // B. STRATEGY 2: Search by Title (Fallback if ID missing or invalid)
         if (!trueData) {
-            const cleanedTitle = item.title?.replace(/[{}]/g, '').replace(/['"]/g, '').replace(/[.,]$/, '').trim();
+            const cleanedTitle = toStr(item.title).replace(/[{}]/g, '').replace(/['"]/g, '').replace(/[.,]$/, '').trim();
 
             if (cleanedTitle) {
                 let foundId = null;
@@ -333,7 +336,7 @@ export async function validateCitations(citations, apiKeys = {}) {
             };
 
             // 1. Journal
-            const normalizeJournal = s => normalize(s?.replace(/&/g, 'and') || '');
+            const normalizeJournal = s => normalize(toStr(s).replace(/&/g, 'and'));
             const genJournal = normalizeJournal(item.extracted_journal);
             const refJournal = normalizeJournal(trueData.journal);
             if (genJournal && refJournal && !stringsMatch(genJournal, refJournal)) {
