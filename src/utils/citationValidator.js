@@ -408,8 +408,9 @@ export async function validateCitations(citations, apiKeys = {}) {
                     }
                 }
                 // b. Check last author (only meaningful when 4+ authors, otherwise already covered)
-                if (genAuthors.length >= 4 && refAuthors.length >= 4) {
-                    if (!authorNamesMatch(genAuthors.at(-1), refAuthors.at(-1))) {
+                const lastGenAuthor = genAuthors.at(-1) || '';
+                if (genAuthors.length >= 4 && refAuthors.length >= 4 && !lastGenAuthor.toLowerCase().includes('et al')) {
+                    if (!authorNamesMatch(lastGenAuthor, refAuthors.at(-1))) {
                         isHallucinated = true;
                         mismatchDetails.push(`Last author mismatch.`);
                     }
