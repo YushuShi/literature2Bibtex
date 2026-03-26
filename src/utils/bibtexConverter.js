@@ -107,7 +107,8 @@ export async function convertToBibtex(input, provider = 'gemini', apiKeys = {}) 
             if (config.type === 'gemini') {
                 result = await callGeminiModel(trimmedInput, model, apiKey);
             } else {
-                result = await callOpenAICompatModel(config.baseURL, model, apiKey, trimmedInput);
+                const baseURL = (apiKeys[`${provider}_baseuri`]?.trim() || config.baseURL).replace(/\/$/, '');
+                result = await callOpenAICompatModel(baseURL, model, apiKey, trimmedInput);
             }
 
             // Safety net: if LLM still returns a string

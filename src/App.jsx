@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
-import { BookOpen, Copy, Download, RefreshCw, FileText, Check, AlertCircle, AlertTriangle, Settings } from 'lucide-react';
+import { BookOpen, Copy, Download, RefreshCw, FileText, Check, AlertCircle, AlertTriangle, Settings, Clock } from 'lucide-react';
 import { convertToBibtex } from './utils/bibtexConverter';
 import { validateCitations } from './utils/citationValidator';
 import { formatCitation, FORMAT_LABELS, PRIMARY_FORMATS, OTHER_FORMATS, buildRIS, buildNBIB } from './utils/formatCitation';
 import { PROVIDERS } from './utils/llmProviders';
+import ApiSettings from './components/ApiSettings';
 
 function App() {
   const [input, setInput] = useState('');
@@ -24,6 +25,9 @@ function App() {
     deepseek: localStorage.getItem('apiKey_deepseek') || '',
     ncbi: localStorage.getItem('apiKey_ncbi') || '',
     elsevier: localStorage.getItem('apiKey_elsevier') || '',
+    openai_baseuri: localStorage.getItem('apiKey_openai_baseuri') || '',
+    qwen_baseuri: localStorage.getItem('apiKey_qwen_baseuri') || '',
+    deepseek_baseuri: localStorage.getItem('apiKey_deepseek_baseuri') || '',
   }));
 
   const handleApiKeyChange = (key, value) => {
@@ -100,14 +104,16 @@ function App() {
   };
 
   const getStatusColor = (status) => {
-    if (status === 'valid') return 'text-slate-800'; // Black
-    if (status === 'corrected') return 'text-orange-600'; // Orange
-    return 'text-red-600'; // Red
+    if (status === 'valid') return 'text-slate-800';
+    if (status === 'corrected') return 'text-orange-600';
+    if (status === 'outdated') return 'text-slate-500';
+    return 'text-red-600';
   };
 
   const getCardStyle = (status) => {
     if (status === 'valid') return 'bg-white border-slate-200';
     if (status === 'corrected') return 'bg-orange-50 border-orange-200';
+    if (status === 'outdated') return 'bg-slate-50 border-slate-300';
     return 'bg-red-50 border-red-200';
   };
 
@@ -130,6 +136,7 @@ function App() {
               <span className="flex items-center text-slate-800"><Check className="w-3 h-3 mr-1" /> Valid (Black)</span>
               <span className="flex items-center text-orange-600 font-medium"><AlertTriangle className="w-3 h-3 mr-1" /> Auto-Corrected (Orange)</span>
               <span className="flex items-center text-red-600 font-medium"><AlertCircle className="w-3 h-3 mr-1" /> Not Found (Red)</span>
+              <span className="flex items-center text-slate-500 font-medium"><Clock className="w-3 h-3 mr-1" /> Out-dated (Grey)</span>
             </span>
           </p>
         </div>
@@ -178,89 +185,7 @@ function App() {
               </div>
 
               {showApiSettings && (
-                <div className="mb-4 p-4 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {/* Only show the key for the selected provider */}
-                  {provider === 'gemini' && (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-600 mb-1">
-                        Gemini API Key <span className="text-red-400">*</span>
-                      </label>
-                      <input
-                        type="password"
-                        value={apiKeys.gemini}
-                        onChange={e => handleApiKeyChange('gemini', e.target.value)}
-                        placeholder="AIza..."
-                        className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
-                      />
-                    </div>
-                  )}
-                  {provider === 'openai' && (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-600 mb-1">
-                        OpenAI API Key <span className="text-red-400">*</span>
-                      </label>
-                      <input
-                        type="password"
-                        value={apiKeys.openai}
-                        onChange={e => handleApiKeyChange('openai', e.target.value)}
-                        placeholder="sk-..."
-                        className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
-                      />
-                    </div>
-                  )}
-                  {provider === 'qwen' && (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-600 mb-1">
-                        Qwen API Key <span className="text-red-400">*</span>
-                      </label>
-                      <input
-                        type="password"
-                        value={apiKeys.qwen}
-                        onChange={e => handleApiKeyChange('qwen', e.target.value)}
-                        placeholder="sk-..."
-                        className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-purple-500 focus:border-transparent outline-none"
-                      />
-                    </div>
-                  )}
-                  {provider === 'deepseek' && (
-                    <div>
-                      <label className="block text-xs font-medium text-slate-600 mb-1">
-                        DeepSeek API Key <span className="text-red-400">*</span>
-                      </label>
-                      <input
-                        type="password"
-                        value={apiKeys.deepseek}
-                        onChange={e => handleApiKeyChange('deepseek', e.target.value)}
-                        placeholder="sk-..."
-                        className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-cyan-500 focus:border-transparent outline-none"
-                      />
-                    </div>
-                  )}
-                  <div>
-                    <label className="block text-xs font-medium text-slate-600 mb-1">
-                      NCBI API Key <span className="text-slate-400">(optional)</span>
-                    </label>
-                    <input
-                      type="password"
-                      value={apiKeys.ncbi}
-                      onChange={e => handleApiKeyChange('ncbi', e.target.value)}
-                      placeholder="Optional"
-                      className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-medium text-slate-600 mb-1">
-                      Elsevier API Key <span className="text-slate-400">(optional)</span>
-                    </label>
-                    <input
-                      type="password"
-                      value={apiKeys.elsevier}
-                      onChange={e => handleApiKeyChange('elsevier', e.target.value)}
-                      placeholder="Optional"
-                      className="w-full bg-white border border-slate-200 rounded-lg px-3 py-2 text-sm text-slate-800 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
-                    />
-                  </div>
-                </div>
+                <ApiSettings provider={provider} apiKeys={apiKeys} onApiKeyChange={handleApiKeyChange} />
               )}
               <label htmlFor="input" className="block text-sm font-semibold text-slate-700 mb-3 flex items-center">
                 <FileText className="w-4 h-4 mr-2 text-blue-500" />
@@ -339,7 +264,11 @@ function App() {
                       )}
 
                       <div className="mt-3 flex flex-wrap gap-2">
-                        {item.status !== 'invalid' ? (
+                        {item.status === 'outdated' ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">
+                            <Clock className="w-3 h-3 mr-1" /> Out-dated (pre-1970)
+                          </span>
+                        ) : item.status !== 'invalid' ? (
                           <>
                             {item.sources.includes('NCBI') && (
                               <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-800">NCBI</span>

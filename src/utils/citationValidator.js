@@ -19,6 +19,20 @@ export async function validateCitations(citations, apiKeys = {}) {
     const validatedResults = [];
 
     for (const item of citations) {
+        // Pre-1970 papers are not indexed in modern databases — skip validation
+        const yearNum = parseInt(item.extracted_year);
+        if (item.extracted_year && !isNaN(yearNum) && yearNum < 1970) {
+            validatedResults.push({
+                ...item,
+                status: 'outdated',
+                sources: [],
+                bibtex: item.bibtex,
+                mismatchDetails: [],
+                resolvedData: null
+            });
+            continue;
+        }
+
         let status = 'invalid'; // 'valid' | 'invalid' | 'corrected'
         let sources = []; // ['NCBI', 'Scopus']
         let trueData = null; // { title, authors: [], journal, year, volume, pages, doi, pmid }
