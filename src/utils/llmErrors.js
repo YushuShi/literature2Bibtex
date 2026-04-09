@@ -6,6 +6,19 @@ export function isModelAccessError(status, message) {
     return m.includes('model') || m.includes('eligible') || m.includes('permission') || m.includes('access');
 }
 
+// Returns true if the error is about model name format/routing (not key validity)
+// e.g. LiteLLM proxies returning 401 "not allowed to access model gpt-4o, try openai.gpt-4o"
+export function isModelNameError(status, message) {
+    if (status !== 401 && status !== 404) return false;
+    const m = (message || '').toLowerCase();
+    return m.includes('not allowed to access model') ||
+        m.includes('team can only access') ||
+        m.includes('tried to access') ||
+        m.includes('model not found') ||
+        m.includes('no model') ||
+        m.includes('does not exist');
+}
+
 // Maps raw errors to bilingual user-friendly messages
 export function toFriendlyMessage(e, providerName, allModelsExhausted = false) {
     const status = e.status;

@@ -1,5 +1,5 @@
-import { PROVIDERS } from './llmProviders';
-import { isModelAccessError, toFriendlyMessage } from './llmErrors';
+import { PROVIDERS, MODEL_ALIASES } from './llmProviders';
+import { isModelAccessError, isModelNameError, toFriendlyMessage } from './llmErrors';
 
 const PROMPT = (trimmedInput) => `You are a citation parser. Parse the input into structured citation data.
 
@@ -85,7 +85,81 @@ async function callOpenAICompatModel(baseURL, model, apiKey, trimmedInput) {
     return parsed.citations ?? (Array.isArray(parsed) ? parsed : Object.values(parsed)[0]);
 }
 
-export async function convertToBibtex(input, provider = 'gemini', apiKeys = {}) {
+// Split raw text into individual citation strings
+function splitCitations(text) {
+    // Strategy 1a: bracketed numbers [N] or (N) — brackets required, avoids DOI fragments
+    const byBracket = text.split(/(?=^\s*[\[\(]\d{1,3}[\]\)]\s)/m).map(s => s.trim()).filter(Boolean);
+    if (byBracket.length > 1) return byBracket;
+    // Strategy 1b: N. format — require space + capital after dot to exclude DOI continuations
+    const byDotNumber = text.split(/(?=^\s*\d+\.\s+[A-Z])/m).map(s => s.trim()).filter(Boolean);
+    if (byDotNumber.length > 1) return byDotNumber;
+    // Strategy 2: paragraph-separated (single or double blank line)
+    const byParagraph = text.split(/\n\s*\n/).map(s => s.trim()).filter(Boolean);
+    if (byParagraph.length > 1) return byParagraph;
+    // Strategy 3: one citation per line
+    return text.split('\n').map(s => s.trim()).filter(Boolean);
+}
+
+const CHUNK_SIZE = 16;
+
+// Core LLM call with model fallback and alias retry (single chunk)
+async function callLLMWithFallback(chunkText, config, providerName, apiKey, apiKeys, provider) {
+    let lastError = null;
+
+    for (const model of config.models) {
+        const variants = [model, ...(MODEL_ALIASES[model] || [])];
+        let modelNameFailed = false;
+
+        for (const variant of variants) {
+            try {
+                let result;
+                if (config.type === 'gemini') {
+                    result = await callGeminiModel(chunkText, variant, apiKey);
+                } else {
+                    const baseURL = (apiKeys[`${provider}_baseuri`]?.trim() || config.baseURL).replace(/\/$/, '');
+                    result = await callOpenAICompatModel(baseURL, variant, apiKey, chunkText);
+                }
+
+                // Safety net: if LLM still returns a string
+                if (typeof result === 'string') {
+                    return [{
+                        original: result, bibtex: '', title: null, doi: null, pmid: null,
+                        extracted_journal: null, extracted_authors: [],
+                        extracted_year: null, extracted_volume: null, extracted_pages: null
+                    }];
+                }
+                return result;
+
+            } catch (e) {
+                // Model name format error → try next alias
+                if (isModelNameError(e.status, e.message)) {
+                    lastError = e;
+                    modelNameFailed = true;
+                    continue;
+                }
+                // Key error / rate limit / balance / network → stop immediately
+                if (e.status === 401 || e.status === 429 || e.status === 402 || !e.status) {
+                    throw new Error(toFriendlyMessage(e, providerName));
+                }
+                // Model access error → stop alias loop, try next fallback model
+                if (isModelAccessError(e.status, e.message)) {
+                    lastError = e;
+                    break;
+                }
+                // Other errors → stop
+                throw new Error(toFriendlyMessage(e, providerName));
+            }
+        }
+
+        // If all aliases exhausted due to model name errors, try next fallback model
+        if (modelNameFailed) continue;
+    }
+
+    // All models exhausted
+    throw new Error(toFriendlyMessage(lastError, providerName, true));
+}
+
+export async function convertToBibtex(input, provider = 'gemini', apiKeys = {}, onProgress) {
     const trimmedInput = input.trim();
     if (!trimmedInput) return null;
 
@@ -99,43 +173,26 @@ export async function convertToBibtex(input, provider = 'gemini', apiKeys = {}) 
         throw new Error(toFriendlyMessage(err, providerName));
     }
 
-    let lastError = null;
+    const citations = splitCitations(trimmedInput);
 
-    for (const model of config.models) {
-        try {
-            let result;
-            if (config.type === 'gemini') {
-                result = await callGeminiModel(trimmedInput, model, apiKey);
-            } else {
-                const baseURL = (apiKeys[`${provider}_baseuri`]?.trim() || config.baseURL).replace(/\/$/, '');
-                result = await callOpenAICompatModel(baseURL, model, apiKey, trimmedInput);
-            }
-
-            // Safety net: if LLM still returns a string
-            if (typeof result === 'string') {
-                return [{
-                    original: result, bibtex: '', title: null, doi: null, pmid: null,
-                    extracted_journal: null, extracted_authors: [],
-                    extracted_year: null, extracted_volume: null, extracted_pages: null
-                }];
-            }
-            return result;
-
-        } catch (e) {
-            // Key error / rate limit / balance / network → stop immediately
-            if (e.status === 401 || e.status === 429 || e.status === 402 || !e.status) {
-                throw new Error(toFriendlyMessage(e, providerName));
-            }
-            // Model access error → try next model
-            if (isModelAccessError(e.status, e.message)) {
-                lastError = e;
-                continue;
-            }
-            // Other errors → stop
-            throw new Error(toFriendlyMessage(e, providerName));
-        }
+    if (citations.length <= CHUNK_SIZE) {
+        // Small input: single call
+        const items = await callLLMWithFallback(trimmedInput, config, providerName, apiKey, apiKeys, provider);
+        return { citations: items, truncated: false };
     }
 
-    // All models exhausted
-    throw new Error(toFriendlyMessage(lastError, providerName, true));
+    // Large input: chunked calls
+    const results = [];
+    let truncated = false;
+    for (let i = 0; i < citations.length; i += CHUNK_SIZE) {
+        onProgress?.(i, citations.length);
+        const slice = citations.slice(i, i + CHUNK_SIZE);
+        const chunk = slice.join('\n\n');
+        const items = await callLLMWithFallback(chunk, config, providerName, apiKey, apiKeys, provider);
+        if (items) {
+            if (items.length < slice.length) truncated = true;
+            results.push(...items);
+        }
+    }
+    return { citations: results, truncated };
 }

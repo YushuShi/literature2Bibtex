@@ -13,9 +13,11 @@ function titleSimilarity(a, b) {
 
 function authorNamesMatch(a, b) {
     if (!a || !b) return false;
-    const tokens = str => str.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(t => t.length > 1);
+    const tokens = str => str.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(t => t.length > 1);
     const ta = tokens(a), tb = tokens(b);
-    if (ta.length === 0 || tb.length === 0) return false;
+    if (ta.length === 0) return true;
+    if (tb.length === 0) return false;
     return ta.some(t => tb.includes(t));
 }
 
@@ -104,7 +106,7 @@ export async function deepSearchByTitle(title, year, authors) {
                 const trueData = {
                     title: data.title || bestResult.title,
                     journal: data['container-title'] || bestResult.journal,
-                    authors: data.author ? data.author.map(a => `${a.given || ''} ${a.family || ''}`.trim()) : bestResult.authors,
+                    authors: data.author ? data.author.filter(a => a.given || a.family).map(a => `${a.given || ''} ${a.family || ''}`.trim()) : bestResult.authors,
                     year: data.issued?.['date-parts']?.[0]?.[0]?.toString() || bestResult.year,
                     volume: data.volume?.toString() || bestResult.volume,
                     issue: data.issue?.toString(),

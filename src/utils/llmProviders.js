@@ -1,3 +1,14 @@
+// Alias variants for model names used by LiteLLM proxies (e.g. university gateways)
+// When the canonical name fails with a model-name error, these are tried in order
+export const MODEL_ALIASES = {
+    'gpt-4o':            ['openai.gpt-4o',       'openai/gpt-4o'],
+    'gpt-4o-mini':       ['openai.gpt-4o-mini',  'openai/gpt-4o-mini'],
+    'qwen-plus':         ['qwen/qwen-plus'],
+    'qwen-turbo':        ['qwen/qwen-turbo'],
+    'deepseek-chat':     ['deepseek/deepseek-chat'],
+    'deepseek-reasoner': ['deepseek/deepseek-reasoner'],
+};
+
 export const PROVIDERS = {
     gemini: {
         name: 'Gemini',

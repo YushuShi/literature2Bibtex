@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { BookOpen, Copy, Download, RefreshCw, FileText, Check, AlertCircle, AlertTriangle, Settings, Clock } from 'lucide-react';
+import { BookOpen, Copy, Download, RefreshCw, FileText, Check, AlertCircle, AlertTriangle, Settings, Clock, HelpCircle } from 'lucide-react';
 import { convertToBibtex } from './utils/bibtexConverter';
 import { validateCitations } from './utils/citationValidator';
 import { formatCitation, FORMAT_LABELS, PRIMARY_FORMATS, OTHER_FORMATS, buildRIS, buildNBIB } from './utils/formatCitation';
@@ -18,6 +18,7 @@ function App() {
   const [showOtherFormats, setShowOtherFormats] = useState(false);
   const [showDownloadMenu, setShowDownloadMenu] = useState(false);
   const [showApiSettings, setShowApiSettings] = useState(false);
+  const [truncationWarning, setTruncationWarning] = useState(false);
   const [apiKeys, setApiKeys] = useState(() => ({
     gemini: localStorage.getItem('apiKey_gemini') || '',
     openai: localStorage.getItem('apiKey_openai') || '',
@@ -41,11 +42,15 @@ function App() {
     setLoading(true);
     setError(null);
     setResults(null);
+    setTruncationWarning(false);
     setStatusMessage(`Parsing citations with ${PROVIDERS[provider].name}...`);
 
     try {
       // 1. Convert to structured BibTeX objects
-      const items = await convertToBibtex(input, provider, apiKeys);
+      const { citations: items, truncated } = await convertToBibtex(input, provider, apiKeys, (done, total) => {
+        setStatusMessage(`Parsing citations ${done + 1}–${Math.min(done + 16, total)} / ${total}...`);
+      });
+      if (truncated) setTruncationWarning(true);
 
       // 2. Validate & Check for Hallucinations
       setStatusMessage('Validating & Checking for Hallucinations...');
@@ -101,12 +106,14 @@ function App() {
   const reset = () => {
     setResults(null);
     setError(null);
+    setTruncationWarning(false);
   };
 
   const getStatusColor = (status) => {
     if (status === 'valid') return 'text-slate-800';
     if (status === 'corrected') return 'text-orange-600';
     if (status === 'outdated') return 'text-slate-500';
+    if (status === 'unverifiable') return 'text-fuchsia-700';
     return 'text-red-600';
   };
 
@@ -114,6 +121,7 @@ function App() {
     if (status === 'valid') return 'bg-white border-slate-200';
     if (status === 'corrected') return 'bg-orange-50 border-orange-200';
     if (status === 'outdated') return 'bg-slate-50 border-slate-300';
+    if (status === 'unverifiable') return 'bg-fuchsia-50 border-fuchsia-200';
     return 'bg-red-50 border-red-200';
   };
 
@@ -137,6 +145,7 @@ function App() {
               <span className="flex items-center text-orange-600 font-medium"><AlertTriangle className="w-3 h-3 mr-1" /> Auto-Corrected (Orange)</span>
               <span className="flex items-center text-red-600 font-medium"><AlertCircle className="w-3 h-3 mr-1" /> Not Found (Red)</span>
               <span className="flex items-center text-slate-500 font-medium"><Clock className="w-3 h-3 mr-1" /> Out-dated (Grey)</span>
+              <span className="flex items-center text-fuchsia-700 font-medium"><HelpCircle className="w-3 h-3 mr-1" /> Non-journal (Purple)</span>
             </span>
           </p>
         </div>
@@ -232,9 +241,15 @@ function App() {
           {/* Report Mode */}
           {results && (
             <div className="grid md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-slate-100 min-h-[600px]">
+              {truncationWarning && (
+                <div className="col-span-2 flex items-start gap-2 px-6 py-3 bg-yellow-50 border-b border-yellow-200 text-yellow-800 text-sm">
+                  <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0 text-yellow-500" />
+                  <span>Some citations may be missing. Your API returned fewer results than expected per batch — this is usually caused by output token limits on your API endpoint or proxy. Try using a direct API key instead of an institutional proxy.</span>
+                </div>
+              )}
 
-              {/* Left: Sources */}
-              <div className="p-6 md:p-8 flex flex-col bg-slate-50/30">
+            {/* Left: Sources */}
+            <div className="p-6 md:p-8 flex flex-col bg-slate-50/30">
                 <div className="flex items-center justify-between mb-4">
                   <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wider">Analysis</h3>
                   <button
@@ -267,6 +282,10 @@ function App() {
                         {item.status === 'outdated' ? (
                           <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">
                             <Clock className="w-3 h-3 mr-1" /> Out-dated (pre-1970)
+                          </span>
+                        ) : item.status === 'unverifiable' ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-fuchsia-100 text-fuchsia-700">
+                            <HelpCircle className="w-3 h-3 mr-1" /> Non-journal · Unverifiable
                           </span>
                         ) : item.status !== 'invalid' ? (
                           <>

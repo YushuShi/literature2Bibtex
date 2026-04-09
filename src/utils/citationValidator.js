@@ -59,7 +59,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                     trueData = {
                         title: data.title,
                         journal: data['container-title'],
-                        authors: data.author ? data.author.map(a => `${a.given || ''} ${a.family || ''}`.trim()) : [],
+                        authors: data.author ? data.author.filter(a => a.given || a.family).map(a => `${a.given || ''} ${a.family || ''}`.trim()) : [],
                         year: data.issued?.['date-parts']?.[0]?.[0]?.toString(),
                         volume: data.volume?.toString(),
                         issue: data.issue?.toString(),
@@ -88,7 +88,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                                 trueData = {
                                     title: r.title,
                                     journal: r.fulljournalname || r.source,
-                                    authors: (r.authors || []).map(a => a.name),
+                                    authors: (r.authors || []).filter(a => a.authtype === 'Author').map(a => a.name),
                                     year: r.pubdate?.split(' ')?.[0],
                                     volume: r.volume,
                                     issue: r.issue,
@@ -121,6 +121,55 @@ export async function validateCitations(citations, apiKeys = {}) {
                 trueData = null;
                 correctedBibtex = null;
                 status = 'invalid';
+            }
+        }
+
+        // A-parallel: After CrossRef success, query NCBI + Scopus in parallel
+        // NCBI author data preferred over CrossRef when available (more reliable ordering)
+        if (foundViaId && trueData && sources.includes('CrossRef/Ref')) {
+            const parDoi = trueData.doi;
+            const parTitle = trueData.title;
+
+            const [ncbiPar, scopusPar] = await Promise.allSettled([
+                // NCBI: search by DOI (fallback: title), then fetch authors via esummary
+                (async () => {
+                    if (!parDoi && !parTitle) return null;
+                    const term = parDoi ? `${parDoi}[doi]` : `${parTitle}[Title]`;
+                    const p = new URLSearchParams({ db: 'pubmed', term, retmode: 'json' });
+                    if (ncbiKey) p.append('api_key', ncbiKey);
+                    const r = await fetch(`${NCBI_URL}?${p}`);
+                    if (!r.ok) return null;
+                    const d = await r.json();
+                    const pmid = d.esearchresult?.idlist?.[0];
+                    if (!pmid) return null;
+                    const p2 = new URLSearchParams({ db: 'pubmed', id: pmid, retmode: 'json' });
+                    if (ncbiKey) p2.append('api_key', ncbiKey);
+                    const r2 = await fetch(`https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?${p2}`);
+                    if (!r2.ok) return null;
+                    const d2 = await r2.json();
+                    const rec = d2.result?.[pmid];
+                    if (!rec || rec.error || !rec.title) return null;
+                    return { authors: (rec.authors || []).filter(a => a.authtype === 'Author').map(a => a.name) };
+                })(),
+                // Scopus: confirm by DOI (badge only, no author data used)
+                (async () => {
+                    if (!elsevierKey || !parDoi) return null;
+                    const r = await fetch(`${SCOPUS_URL}?query=DOI(${encodeURIComponent(parDoi)})&count=1`, {
+                        headers: { 'X-ELS-APIKey': elsevierKey, 'Accept': 'application/json' }
+                    });
+                    if (!r.ok) return null;
+                    const d = await r.json();
+                    const entry = d['search-results']?.entry?.[0];
+                    return (entry && !entry.error) ? true : null;
+                })()
+            ]);
+
+            if (ncbiPar.status === 'fulfilled' && ncbiPar.value?.authors?.length > 0) {
+                sources.push('NCBI');
+                trueData = { ...trueData, authors: ncbiPar.value.authors };
+            }
+            if (scopusPar.status === 'fulfilled' && scopusPar.value) {
+                sources.push('Scopus');
             }
         }
 
@@ -266,7 +315,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                             trueData = {
                                 title: data.title,
                                 journal: data['container-title'],
-                                authors: data.author ? data.author.map(a => `${a.given || ''} ${a.family || ''}`.trim()) : [],
+                                authors: data.author ? data.author.filter(a => a.given || a.family).map(a => `${a.given || ''} ${a.family || ''}`.trim()) : [],
                                 year: data.issued?.['date-parts']?.[0]?.[0]?.toString(),
                                 volume: data.volume?.toString(),
                                 issue: data.issue?.toString(),
@@ -290,7 +339,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                                     const r = ncbiData.result?.[foundId];
                                     if (r && !r.error && r.title) {
                                         const doi = r.elocationid?.replace('doi: ', '').trim() || null;
-                                        const authors = (r.authors || []).map(a => a.name);
+                                        const authors = (r.authors || []).filter(a => a.authtype === 'Author').map(a => a.name);
                                         const year = r.pubdate?.split(' ')?.[0];
                                         trueData = {
                                             title: r.title,
@@ -318,7 +367,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                                     const crJson = await crRes.json();
                                     const w = crJson.message;
                                     if (w?.title?.[0]) {
-                                        const authors = (w.author || []).map(a => `${a.given || ''} ${a.family || ''}`.trim());
+                                        const authors = (w.author || []).filter(a => a.given || a.family).map(a => `${a.given || ''} ${a.family || ''}`.trim());
                                         const year = w.issued?.['date-parts']?.[0]?.[0]?.toString()
                                             || w['published-online']?.['date-parts']?.[0]?.[0]?.toString();
                                         trueData = {
@@ -344,29 +393,60 @@ export async function validateCitations(citations, apiKeys = {}) {
             }
         }
 
-        // B-check: title-search result has year diff > 2
-        if (trueData && !foundViaId && item.extracted_year && trueData.year) {
-            if (Math.abs(parseInt(item.extracted_year) - parseInt(trueData.year)) > 2) {
-                const genFirstAuthor = (item.extracted_authors || [])[0];
-                const refFirstAuthor = (trueData.authors || [])[0];
-                const authorMatches = genFirstAuthor && refFirstAuthor && authorNamesMatch(genFirstAuthor, refFirstAuthor);
+        // B-check: verify title-search result is the right paper
+        if (trueData && !foundViaId) {
+            const genFirstAuthor = (item.extracted_authors || [])[0];
+            const refFirstAuthor = (trueData.authors || [])[0];
+            const authorMismatch = genFirstAuthor && refFirstAuthor &&
+                !authorNamesMatch(genFirstAuthor, refFirstAuthor);
 
-                if (!authorMatches) {
-                    // Author mismatch → likely a different same-title paper → deep search with year filter
-                    const deepResult = await deepSearchByTitle(item.title, item.extracted_year, item.extracted_authors);
-                    if (deepResult) {
-                        trueData = deepResult.trueData;
-                        correctedBibtex = deepResult.correctedBibtex;
-                        sources = [deepResult.source];
-                        status = 'valid';
-                    } else {
-                        trueData = null;
-                        correctedBibtex = null;
-                        status = 'invalid';
-                        sources = [];
-                    }
+            const extractedJournal = toStr(item.extracted_journal);
+            const foundJournal = toStr(trueData.journal);
+            const journalMismatch = extractedJournal && foundJournal &&
+                titleSimilarity(extractedJournal, foundJournal) < 0.3 &&
+                !journalAbbrevMatch(extractedJournal, foundJournal);
+
+            const yearMismatch = item.extracted_year && trueData.year &&
+                Math.abs(parseInt(item.extracted_year) - parseInt(trueData.year)) > 1;
+
+            if (authorMismatch && journalMismatch) {
+                // Author + journal both disagree → likely found a different same-title paper → deep search
+                const deepResult = await deepSearchByTitle(item.title, item.extracted_year, item.extracted_authors);
+                if (deepResult) {
+                    trueData = deepResult.trueData;
+                    correctedBibtex = deepResult.correctedBibtex;
+                    sources = [deepResult.source];
+                    status = 'valid';
+                } else {
+                    trueData = null;
+                    correctedBibtex = null;
+                    status = 'invalid';
+                    sources = [];
                 }
-                // Author matches → same paper, year is hallucinated → fall through to Compare Phase
+            } else if (authorMismatch && yearMismatch) {
+                // Author + year both disagree → likely wrong paper → deep search
+                const deepResult = await deepSearchByTitle(item.title, item.extracted_year, item.extracted_authors);
+                if (deepResult) {
+                    trueData = deepResult.trueData;
+                    correctedBibtex = deepResult.correctedBibtex;
+                    sources = [deepResult.source];
+                    status = 'valid';
+                } else {
+                    trueData = null;
+                    correctedBibtex = null;
+                    status = 'invalid';
+                    sources = [];
+                }
+            } else if (yearMismatch) {
+                // Year diff only (author + journal match) → could be online-first → deep search for better match
+                const deepResult = await deepSearchByTitle(item.title, item.extracted_year, item.extracted_authors);
+                if (deepResult) {
+                    trueData = deepResult.trueData;
+                    correctedBibtex = deepResult.correctedBibtex;
+                    sources = [deepResult.source];
+                    status = 'valid';
+                }
+                // If not found: keep trueData → Compare Phase will flag year diff
             }
         }
 
@@ -440,7 +520,8 @@ export async function validateCitations(citations, apiKeys = {}) {
             const genJournal = normalizeJournal(item.extracted_journal);
             const refJournal = normalizeJournal(trueData.journal);
             if (genJournal && refJournal && !stringsMatch(genJournal, refJournal)
-                && titleSimilarity(toStr(item.extracted_journal), toStr(trueData.journal)) < 0.7) {
+                && titleSimilarity(toStr(item.extracted_journal), toStr(trueData.journal)) < 0.7
+                && !journalAbbrevMatch(toStr(item.extracted_journal), toStr(trueData.journal))) {
                 isHallucinated = true;
                 mismatchDetails.push(`Journal: "${item.extracted_journal}" vs "${trueData.journal}"`);
             }
@@ -448,25 +529,34 @@ export async function validateCitations(citations, apiKeys = {}) {
             // 2. Authors
             const genAuthors = item.extracted_authors || [];
             const refAuthors = trueData.authors || [];
-            if (genAuthors.length > 0 && refAuthors.length > 0) {
+            const isCollective = name =>
+                /\b(group|committee|members|task\s+force|collaboration|consortium|developed|network|initiative|investigators|association|society|foundation|rehabilitation|prevention|federation)\b/i.test(name);
+            const allRefCollective = refAuthors.length > 0 && refAuthors.every(a => isCollective(a));
+            if (genAuthors.length > 0 && refAuthors.length > 0 && !allRefCollective) {
+                // If gen[0] is an organizational entity but ref[0] is not, skip gen[0] for comparison
+                const genOffset = (genAuthors.length > 1 && isCollective(genAuthors[0]) && !isCollective(refAuthors[0])) ? 1 : 0;
                 // a. Check first 3 authors
-                const checkCount = Math.min(3, genAuthors.length, refAuthors.length);
+                const checkCount = Math.min(3, genAuthors.length - genOffset, refAuthors.length);
                 for (let i = 0; i < checkCount; i++) {
-                    if (!authorNamesMatch(genAuthors[i], refAuthors[i])) {
+                    const match = authorNamesMatch(genAuthors[i + genOffset], refAuthors[i]);
+                    if (!match) {
                         isHallucinated = true;
                         mismatchDetails.push(`Author ${i + 1} mismatch.`);
                     }
                 }
-                // b. Check last author (only meaningful when 4+ authors, otherwise already covered)
+                // b. Check last author (only when 4+ authors, same count, and last gen is not "et al.")
                 const lastGenAuthor = genAuthors.at(-1) || '';
-                if (genAuthors.length >= 4 && refAuthors.length >= 4 && !lastGenAuthor.toLowerCase().includes('et al')) {
+                if (genAuthors.length >= 4 && genAuthors.length === refAuthors.length
+                    && !lastGenAuthor.toLowerCase().includes('et al')) {
                     if (!authorNamesMatch(lastGenAuthor, refAuthors.at(-1))) {
                         isHallucinated = true;
                         mismatchDetails.push(`Last author mismatch.`);
                     }
                 }
                 // c. Check count: flag if LLM listed MORE authors than actually exist
-                if (genAuthors.length > refAuthors.length) {
+                // diff >= 2 required: allow 1 author missing from DB (common data quality gap)
+                // (skip when refAuthors has only 1 entry — Scopus dc:creator is inherently incomplete)
+                if (refAuthors.length > 1 && genAuthors.length > refAuthors.length + 1) {
                     isHallucinated = true;
                     mismatchDetails.push(`Author count: extracted ${genAuthors.length}, actual ${refAuthors.length}.`);
                 }
@@ -483,19 +573,36 @@ export async function validateCitations(citations, apiKeys = {}) {
 
             // 5. Pages
             if (item.extracted_pages && trueData.pages) {
-                const extractedHasRange = /[–—-]/.test(item.extracted_pages);
-                if (extractedHasRange) {
-                    // Full range: normalize abbreviated end (e.g. "577-80" → "577-580")
-                    if (normalizePageRange(item.extracted_pages) !== normalizePageRange(trueData.pages)) {
-                        isHallucinated = true;
-                        mismatchDetails.push(`Pages: "${item.extracted_pages}" vs "${trueData.pages}"`);
-                    }
-                } else {
-                    // Single start page: only compare start pages
-                    const trueStart = trueData.pages.replace(/[–—-].*$/, '').trim();
-                    if (normalize(item.extracted_pages) !== normalize(trueStart)) {
-                        isHallucinated = true;
-                        mismatchDetails.push(`Pages: "${item.extracted_pages}" vs "${trueData.pages}"`);
+                const ep = item.extracted_pages.trim();
+                const tp = trueData.pages.trim();
+                const hasRangeSep = s => /[–—~-]/.test(s);
+                if (!isArticleId(ep) && !isArticleId(tp)) {
+                    if (hasRangeSep(ep)) {
+                        if (hasRangeSep(tp)) {
+                            // Both sides are ranges: normalize abbreviated end (e.g. "577-80" → "577-580")
+                            if (normalizePageRange(ep) !== normalizePageRange(tp)) {
+                                isHallucinated = true;
+                                mismatchDetails.push(`Pages: "${ep}" vs "${tp}"`);
+                            }
+                        } else {
+                            // DB only has start page: compare start pages
+                            const epStart = ep.replace(/[–—~-].*$/, '').trim();
+                            if (normalize(epStart) !== normalize(tp)) {
+                                isHallucinated = true;
+                                mismatchDetails.push(`Pages: "${ep}" vs "${tp}"`);
+                            }
+                        }
+                    } else {
+                        // ep is a bare number: compare against start of tp range
+                        const trueStart = tp.replace(/[–—~-].*$/, '').trim();
+                        if (normalize(ep) !== normalize(trueStart)) {
+                            // Don't flag if ep looks like a standalone article ID (5+ digits)
+                            // e.g. "43034" vs "93-94" — different publication systems
+                            if (!/^\d{5,}$/.test(ep)) {
+                                isHallucinated = true;
+                                mismatchDetails.push(`Pages: "${ep}" vs "${tp}"`);
+                            }
+                        }
                     }
                 }
             }
@@ -505,9 +612,17 @@ export async function validateCitations(citations, apiKeys = {}) {
             }
         }
 
+        // Non-journal / unverifiable: book, web resource, grey literature
+        if (status === 'invalid') {
+            const bibtexType = (item.bibtex || '').trim().toLowerCase();
+            const isNonJournal = /^@(book|misc|techreport|manual|inbook|incollection)\b/.test(bibtexType)
+                || (!item.extracted_journal && !item.doi && !item.pmid);
+            if (isNonJournal) status = 'unverifiable';
+        }
+
         validatedResults.push({
             ...item,
-            status, // 'valid', 'corrected', 'invalid'
+            status, // 'valid', 'corrected', 'invalid', 'unverifiable', 'outdated'
             sources,
             bibtex: correctedBibtex || item.bibtex,
             mismatchDetails,
@@ -522,10 +637,14 @@ export async function validateCitations(citations, apiKeys = {}) {
 
 function authorNamesMatch(a, b) {
     if (!a || !b) return false;
-    // Split into tokens, exclude single-char initials (e.g. "L", "B")
-    const tokens = str => str.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(t => t.length > 1);
+    // NFD normalization: decompose precomposed chars (á→a+combining) then strip combining marks
+    // This unifies PDF-extracted decomposed accents with database precomposed Unicode
+    const tokens = str => str.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(t => t.length > 1);
     const ta = tokens(a), tb = tokens(b);
-    if (ta.length === 0 || tb.length === 0) return false;
+    // If extracted name has no valid tokens (garbled PDF chars), skip comparison
+    if (ta.length === 0) return true;
+    if (tb.length === 0) return false;
     // Match if any meaningful token (family name) appears in both
     return ta.some(t => tb.includes(t));
 }
@@ -547,6 +666,29 @@ function normalize(str) {
 function stringsMatch(s1, s2) {
     if (!s1 || !s2) return false;
     return s1.includes(s2) || s2.includes(s1);
+}
+
+function journalAbbrevMatch(a, b) {
+    // Check if one is an ISO 4 abbreviation of the other
+    // e.g. "J. Psychiatr. Res." ↔ "Journal of Psychiatric Research"
+    // Both-direction prefix match: every token in each side must prefix-match some token on the other side
+    const stopWords = new Set(['the', 'and', 'of', 'in', 'for', 'on', 'a', 'an', 'amp']);
+    const tokens = s => s.toLowerCase()
+        .replace(/&amp;|&/g, ' ')
+        .replace(/[^a-z0-9]/g, ' ')
+        .split(/\s+/)
+        .filter(t => t.length > 0 && !stopWords.has(t));
+    const ta = tokens(a), tb = tokens(b);
+    if (ta.length === 0 || tb.length === 0) return false;
+    // check(abbrev, full): every abbrev token prefixes some full token, AND every full token is prefixed by some abbrev token
+    const check = (abbrev, full) =>
+        abbrev.every(x => full.some(y => y.startsWith(x))) &&
+        full.every(y => abbrev.some(x => y.startsWith(x)));
+    return check(ta, tb) || check(tb, ta);
+}
+
+function isArticleId(p) {
+    return /^\d{6,}$/.test(p.trim());
 }
 
 function normalizePageRange(p) {
