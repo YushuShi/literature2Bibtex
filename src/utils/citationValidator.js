@@ -38,6 +38,8 @@ export async function validateCitations(citations, apiKeys = {}) {
         let trueData = null; // { title, authors: [], journal, year, volume, pages, doi, pmid }
         let correctedBibtex = null;
         let mismatchDetails = [];
+        let lowConfidenceTitle = false; // true when CrossRef found via 0.70–0.85 title similarity
+        let crossRefAuthors = null;    // CrossRef author list saved before NCBI A-parallel may replace
 
         // --- 1. RESOLUTION PHASE: Try to get True Metadata ---
         let idType = null;
@@ -70,6 +72,7 @@ export async function validateCitations(citations, apiKeys = {}) {
                     foundViaId = true;
                     if (sources.length === 0) sources.push("CrossRef/Ref");
                     correctedBibtex = cite.format('bibtex', { format: 'text' });
+                    crossRefAuthors = [...trueData.authors]; // save before A-parallel may replace with NCBI
                 }
             } catch (e) {
                 console.warn(`[Strategy A] Cite.async failed for "${idValue}":`, e.message);
@@ -84,7 +87,13 @@ export async function validateCitations(citations, apiKeys = {}) {
                             const ncbiData = await res.json();
                             const r = ncbiData.result?.[pmidFromUrl];
                             if (r && !r.error && r.title) {
-                                const doi = r.elocationid?.replace('doi: ', '').trim() || null;
+                                let doi = (r.articleids || []).find(a => a.idtype === 'doi')?.value || null;
+                                if (!doi) {
+                                    try {
+                                        const idcRes = await fetch(`https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids=${pmidFromUrl}&format=json`);
+                                        if (idcRes.ok) doi = (await idcRes.json()).records?.[0]?.doi || null;
+                                    } catch (e) { /* ignore */ }
+                                }
                                 trueData = {
                                     title: r.title,
                                     journal: r.fulljournalname || r.source,
@@ -266,6 +275,10 @@ export async function validateCitations(citations, apiKeys = {}) {
                             if (bestCRSim >= TITLE_SIM_THRESHOLD && bestCR?.DOI) {
                                 foundId = bestCR.DOI;
                                 foundSource = 'CrossRef';
+                            } else if (bestCRSim >= 0.70 && bestCR?.DOI) {
+                                foundId = bestCR.DOI;
+                                foundSource = 'CrossRef';
+                                lowConfidenceTitle = true;
                             }
                         }
                     } catch (e) { console.warn('[CrossRef] failed:', e); }
@@ -338,7 +351,15 @@ export async function validateCitations(citations, apiKeys = {}) {
                                     const ncbiData = await res.json();
                                     const r = ncbiData.result?.[foundId];
                                     if (r && !r.error && r.title) {
-                                        const doi = r.elocationid?.replace('doi: ', '').trim() || null;
+                                        let doiFromArticleids = (r.articleids || []).find(a => a.idtype === 'doi')?.value || null;
+                                        let doiFromIdConv = null;
+                                        if (!doiFromArticleids) {
+                                            try {
+                                                const idcRes = await fetch(`https://www.ncbi.nlm.nih.gov/pmc/utils/idconv/v1.0/?ids=${foundId}&format=json`);
+                                                if (idcRes.ok) doiFromIdConv = (await idcRes.json()).records?.[0]?.doi || null;
+                                            } catch (e) { /* ignore */ }
+                                        }
+                                        const doi = doiFromArticleids || doiFromIdConv;
                                         const authors = (r.authors || []).filter(a => a.authtype === 'Author').map(a => a.name);
                                         const year = r.pubdate?.split(' ')?.[0];
                                         trueData = {
@@ -502,18 +523,9 @@ export async function validateCitations(citations, apiKeys = {}) {
 
         // --- 3. COMPARE PHASE: Hallucination Check (Details) ---
         if (trueData) {
-            let isHallucinated = false;
-
-            // Helper to compare fields
-            const checkMismatch = (extracted, distinctTrue, label) => {
-                if (extracted && distinctTrue && normalize(extracted) !== normalize(distinctTrue)) {
-                    // Fuzzy check: sometimes volume is "45" vs "45(2)" or pages "123-145" vs "123"
-                    if (!distinctTrue.includes(extracted) && !extracted.includes(distinctTrue)) {
-                        isHallucinated = true;
-                        mismatchDetails.push(`${label}: "${extracted}" vs "${distinctTrue}"`);
-                    }
-                }
-            };
+            // pendingMismatches: journal / year / volume / pages — sent to CrossRef arbitration if mismatch
+            // Authors are committed directly (NCBI author data is generally more reliable than CrossRef)
+            const pendingMismatches = []; // { field, label, extracted }
 
             // 1. Journal
             const normalizeJournal = s => normalize(toStr(s).replace(/&/g, 'and'));
@@ -522,26 +534,35 @@ export async function validateCitations(citations, apiKeys = {}) {
             if (genJournal && refJournal && !stringsMatch(genJournal, refJournal)
                 && titleSimilarity(toStr(item.extracted_journal), toStr(trueData.journal)) < 0.7
                 && !journalAbbrevMatch(toStr(item.extracted_journal), toStr(trueData.journal))) {
-                isHallucinated = true;
-                mismatchDetails.push(`Journal: "${item.extracted_journal}" vs "${trueData.journal}"`);
+                pendingMismatches.push({ field: 'journal', label: `Journal: "${item.extracted_journal}" vs "${trueData.journal}"`, extracted: toStr(item.extracted_journal) });
             }
 
-            // 2. Authors
+            // 2. Authors (committed directly, not arbitrated via CrossRef)
             const genAuthors = item.extracted_authors || [];
             const refAuthors = trueData.authors || [];
             const isCollective = name =>
                 /\b(group|committee|members|task\s+force|collaboration|consortium|developed|network|initiative|investigators|association|society|foundation|rehabilitation|prevention|federation)\b/i.test(name);
             const allRefCollective = refAuthors.length > 0 && refAuthors.every(a => isCollective(a));
             if (genAuthors.length > 0 && refAuthors.length > 0 && !allRefCollective) {
-                // If gen[0] is an organizational entity but ref[0] is not, skip gen[0] for comparison
                 const genOffset = (genAuthors.length > 1 && isCollective(genAuthors[0]) && !isCollective(refAuthors[0])) ? 1 : 0;
                 // a. Check first 3 authors
                 const checkCount = Math.min(3, genAuthors.length - genOffset, refAuthors.length);
+                console.log(`[DBG-Auth] "${item.title?.substring(0,45)}" | src:${sources} | genOff:${genOffset} | chk:${checkCount} | gen:`, genAuthors, '| ref:', refAuthors);
+                const allKnownAuthors = [
+                    ...refAuthors,
+                    ...(crossRefAuthors || [])
+                ];
                 for (let i = 0; i < checkCount; i++) {
-                    const match = authorNamesMatch(genAuthors[i + genOffset], refAuthors[i]);
-                    if (!match) {
-                        isHallucinated = true;
-                        mismatchDetails.push(`Author ${i + 1} mismatch.`);
+                    const matched = authorNamesMatch(genAuthors[i + genOffset], refAuthors[i]);
+                    if (!matched) {
+                        console.log(`[DBG-Auth]   Author ${i+1} MISMATCH: gen="${genAuthors[i+genOffset]}" ref="${refAuthors[i]}"`);
+                        // Check if gen author appears anywhere in either known list (ordering vs fabrication)
+                        const foundElsewhere = allKnownAuthors.some(r => authorNamesMatch(genAuthors[i + genOffset], r));
+                        if (foundElsewhere) {
+                            mismatchDetails.push(`Author ${i + 1} mismatch (found in different position).`);
+                        } else {
+                            mismatchDetails.push(`Author ${i + 1} mismatch (possibly fabricated).`);
+                        }
                     }
                 }
                 // b. Check last author (only when 4+ authors, same count, and last gen is not "et al.")
@@ -549,7 +570,6 @@ export async function validateCitations(citations, apiKeys = {}) {
                 if (genAuthors.length >= 4 && genAuthors.length === refAuthors.length
                     && !lastGenAuthor.toLowerCase().includes('et al')) {
                     if (!authorNamesMatch(lastGenAuthor, refAuthors.at(-1))) {
-                        isHallucinated = true;
                         mismatchDetails.push(`Last author mismatch.`);
                     }
                 }
@@ -557,58 +577,142 @@ export async function validateCitations(citations, apiKeys = {}) {
                 // diff >= 2 required: allow 1 author missing from DB (common data quality gap)
                 // (skip when refAuthors has only 1 entry — Scopus dc:creator is inherently incomplete)
                 if (refAuthors.length > 1 && genAuthors.length > refAuthors.length + 1) {
-                    isHallucinated = true;
                     mismatchDetails.push(`Author count: extracted ${genAuthors.length}, actual ${refAuthors.length}.`);
                 }
             }
 
             // 3. Year (1-year difference tolerated: online-first vs print)
             if (item.extracted_year && trueData.year && Math.abs(parseInt(item.extracted_year) - parseInt(trueData.year)) > 1) {
-                isHallucinated = true;
-                mismatchDetails.push(`Year: "${item.extracted_year}" vs "${trueData.year}"`);
+                pendingMismatches.push({ field: 'year', label: `Year: "${item.extracted_year}" vs "${trueData.year}"`, extracted: item.extracted_year });
             }
 
             // 4. Volume
-            checkMismatch(item.extracted_volume, trueData.volume, "Volume");
+            const ev = toStr(item.extracted_volume), tv = toStr(trueData.volume);
+            if (ev && tv && normalize(ev) !== normalize(tv) && !tv.includes(ev) && !ev.includes(tv)) {
+                pendingMismatches.push({ field: 'volume', label: `Volume: "${ev}" vs "${tv}"`, extracted: ev });
+            }
 
             // 5. Pages
+            const hasRangeSep = s => /[–—~-]/.test(s);
             if (item.extracted_pages && trueData.pages) {
-                const ep = item.extracted_pages.trim();
-                const tp = trueData.pages.trim();
-                const hasRangeSep = s => /[–—~-]/.test(s);
+                const ep = stripEloc(item.extracted_pages.trim());
+                const tp = stripEloc(trueData.pages.trim());
                 if (!isArticleId(ep) && !isArticleId(tp)) {
+                    let pagesMismatch = false;
                     if (hasRangeSep(ep)) {
                         if (hasRangeSep(tp)) {
-                            // Both sides are ranges: normalize abbreviated end (e.g. "577-80" → "577-580")
-                            if (normalizePageRange(ep) !== normalizePageRange(tp)) {
-                                isHallucinated = true;
-                                mismatchDetails.push(`Pages: "${ep}" vs "${tp}"`);
-                            }
+                            if (normalizePageRange(ep) !== normalizePageRange(tp)) pagesMismatch = true;
                         } else {
                             // DB only has start page: compare start pages
                             const epStart = ep.replace(/[–—~-].*$/, '').trim();
-                            if (normalize(epStart) !== normalize(tp)) {
-                                isHallucinated = true;
-                                mismatchDetails.push(`Pages: "${ep}" vs "${tp}"`);
-                            }
+                            if (normalize(epStart) !== normalize(tp)) pagesMismatch = true;
                         }
                     } else {
                         // ep is a bare number: compare against start of tp range
                         const trueStart = tp.replace(/[–—~-].*$/, '').trim();
-                        if (normalize(ep) !== normalize(trueStart)) {
-                            // Don't flag if ep looks like a standalone article ID (5+ digits)
-                            // e.g. "43034" vs "93-94" — different publication systems
-                            if (!/^\d{5,}$/.test(ep)) {
-                                isHallucinated = true;
-                                mismatchDetails.push(`Pages: "${ep}" vs "${tp}"`);
-                            }
-                        }
+                        if (normalize(ep) !== normalize(trueStart) && !/^\d{5,}$/.test(ep)) pagesMismatch = true;
+                    }
+                    if (pagesMismatch) {
+                        pendingMismatches.push({ field: 'pages', label: `Pages: "${ep}" vs "${tp}"`, extracted: ep });
                     }
                 }
             }
 
-            if (isHallucinated) {
-                status = 'corrected';
+            // CrossRef Arbitration: when NCBI data causes a mismatch, consult CrossRef as secondary source
+            // Skip if CrossRef was already the primary source (would yield the same result)
+            let isHallucinated = mismatchDetails.length > 0; // author mismatches already committed above
+            if (pendingMismatches.length > 0) {
+                const canArbitrate = trueData.doi && !sources.some(s => s.includes('CrossRef'));
+                if (canArbitrate) {
+                    let w = null;
+                    try {
+                        const crRes = await fetch(`https://api.crossref.org/works/${trueData.doi}`);
+                        if (crRes.ok) w = (await crRes.json()).message || null;
+                    } catch (e) {
+                        console.warn('[CrossRef arbitration] fetch failed:', e.message);
+                    }
+
+                    if (w) {
+                        // Collect CrossRef authors for fabrication detection (zero extra API cost)
+                        if (!crossRefAuthors && w.author) {
+                            crossRefAuthors = (w.author || [])
+                                .filter(a => a.given || a.family)
+                                .map(a => `${a.given || ''} ${a.family || ''}`.trim());
+                        }
+                        const crJournal = w['container-title']?.[0] || w['short-container-title']?.[0] || '';
+                        const crYear = w.issued?.['date-parts']?.[0]?.[0]?.toString()
+                            || w['published-online']?.['date-parts']?.[0]?.[0]?.toString() || '';
+                        const crVolume = w.volume?.toString() || '';
+                        const crPages = w.page?.toString() || '';
+
+                        let xrefHelped = false;
+                        for (const pm of pendingMismatches) {
+                            let resolved = false;
+                            if (pm.field === 'pages' && crPages) {
+                                const crPg = stripEloc(crPages.trim());
+                                const exPg = pm.extracted;
+                                if (isArticleId(crPg)) {
+                                    // CrossRef confirms article number (e.g. "1099-1099") — cannot compare
+                                    // with print page range; treat as valid (DB lacks print pagination)
+                                    resolved = true;
+                                } else if (!isArticleId(exPg)) {
+                                    if (hasRangeSep(exPg)) {
+                                        resolved = hasRangeSep(crPg)
+                                            ? normalizePageRange(exPg) === normalizePageRange(crPg)
+                                            : normalize(exPg.replace(/[–—~-].*$/, '').trim()) === normalize(crPg);
+                                    } else {
+                                        resolved = normalize(exPg) === normalize(crPg.replace(/[–—~-].*$/, '').trim());
+                                    }
+                                }
+                            } else if (pm.field === 'journal' && crJournal) {
+                                resolved = journalAbbrevMatch(pm.extracted, crJournal)
+                                    || titleSimilarity(pm.extracted, crJournal) >= 0.7;
+                            } else if (pm.field === 'year' && crYear) {
+                                resolved = Math.abs(parseInt(pm.extracted) - parseInt(crYear)) <= 1;
+                            } else if (pm.field === 'volume' && crVolume) {
+                                resolved = normalize(pm.extracted) === normalize(crVolume)
+                                    || crVolume.includes(pm.extracted) || pm.extracted.includes(crVolume);
+                            }
+
+                            if (resolved) {
+                                xrefHelped = true;
+                            } else {
+                                isHallucinated = true;
+                                mismatchDetails.push(pm.label);
+                            }
+                        }
+                        if (xrefHelped && !sources.includes('CrossRef')) sources.push('CrossRef');
+                    } else {
+                        // CrossRef returned no match — commit pending mismatches directly
+                        isHallucinated = true;
+                        mismatchDetails.push(...pendingMismatches.map(m => m.label));
+                    }
+                } else {
+                    // No DOI available, or CrossRef already primary — commit pending mismatches directly
+                    isHallucinated = true;
+                    mismatchDetails.push(...pendingMismatches.map(m => m.label));
+                }
+            }
+
+            if (isHallucinated) status = 'corrected';
+
+            // Low-confidence title match (0.70–0.85): require at most 1 mismatch category
+            // If 2+ field categories mismatch, this is likely a different paper → reject
+            if (lowConfidenceTitle && status !== 'invalid') {
+                const mismatchCats = new Set(mismatchDetails.map(m =>
+                    (m.startsWith('Author') || m.startsWith('Last')) ? 'author'
+                    : m.startsWith('Journal') ? 'journal'
+                    : m.startsWith('Year') ? 'year'
+                    : m.startsWith('Volume') ? 'volume'
+                    : m.startsWith('Pages') ? 'pages' : 'other'
+                ));
+                if (mismatchCats.size >= 2) {
+                    status = 'invalid';
+                    trueData = null;
+                    correctedBibtex = null;
+                    sources = [];
+                    mismatchDetails = [];
+                }
             }
         }
 
@@ -673,7 +777,10 @@ function journalAbbrevMatch(a, b) {
     // e.g. "J. Psychiatr. Res." ↔ "Journal of Psychiatric Research"
     // Both-direction prefix match: every token in each side must prefix-match some token on the other side
     const stopWords = new Set(['the', 'and', 'of', 'in', 'for', 'on', 'a', 'an', 'amp']);
-    const tokens = s => s.toLowerCase()
+    // Strip NCBI-style subtitle: "Journal of Foo : official journal of the Bar Society" → "Journal of Foo"
+    // Requires space before ":" to avoid splitting "CA: A Cancer Journal for Clinicians" at the colon
+    const stripSubtitle = s => s.split(/\s+:\s+/)[0];
+    const tokens = s => stripSubtitle(s).toLowerCase()
         .replace(/&amp;|&/g, ' ')
         .replace(/[^a-z0-9]/g, ' ')
         .split(/\s+/)
@@ -688,7 +795,20 @@ function journalAbbrevMatch(a, b) {
 }
 
 function isArticleId(p) {
-    return /^\d{6,}$/.test(p.trim());
+    const s = p.trim();
+    if (/^\d{6,}$/.test(s)) return true;
+    // CrossRef represents article numbers as "N-N" (start == end, N ≥ 3 digits)
+    // e.g. "1099-1099" — Springer Nature submits article numbers this way
+    if (/^(\d{3,})-\1$/.test(s)) return true;
+    return false;
+}
+
+function stripEloc(s) {
+    // Strip electronic location suffix (.eN or space+eN) after a numeric page range
+    // e.g. "949-963.e18" → "949-963", "1653–1666 e7" → "1653–1666"
+    // Requires numeric main body to avoid stripping standalone "e15" article IDs
+    const m = s.match(/^(\d[\d\u2013\u2014~-]*\d)\s*\.?\s*e\d+$/i);
+    return m ? m[1] : s;
 }
 
 function normalizePageRange(p) {
