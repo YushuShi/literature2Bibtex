@@ -4,3 +4,4 @@ changelog*.txt
 .claude/
 *.bak.js
 "src/utils - 副本-0306/"
+history_*.md
