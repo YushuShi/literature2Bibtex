@@ -545,19 +545,21 @@ export async function validateCitations(citations, apiKeys = {}) {
             const allRefCollective = refAuthors.length > 0 && refAuthors.every(a => isCollective(a));
             if (genAuthors.length > 0 && refAuthors.length > 0 && !allRefCollective) {
                 const genOffset = (genAuthors.length > 1 && isCollective(genAuthors[0]) && !isCollective(refAuthors[0])) ? 1 : 0;
+                // Strip "et al." placeholders before comparison (LLM extracts them literally from abbreviated citations)
+                const effectiveGenAuthors = genAuthors.filter(a => !a.toLowerCase().includes('et al'));
                 // a. Check first 3 authors
-                const checkCount = Math.min(3, genAuthors.length - genOffset, refAuthors.length);
+                const checkCount = Math.min(3, effectiveGenAuthors.length - genOffset, refAuthors.length);
                 console.log(`[DBG-Auth] "${item.title?.substring(0,45)}" | src:${sources} | genOff:${genOffset} | chk:${checkCount} | gen:`, genAuthors, '| ref:', refAuthors);
                 const allKnownAuthors = [
                     ...refAuthors,
                     ...(crossRefAuthors || [])
                 ];
                 for (let i = 0; i < checkCount; i++) {
-                    const matched = authorNamesMatch(genAuthors[i + genOffset], refAuthors[i]);
+                    const matched = authorNamesMatch(effectiveGenAuthors[i + genOffset], refAuthors[i]);
                     if (!matched) {
-                        console.log(`[DBG-Auth]   Author ${i+1} MISMATCH: gen="${genAuthors[i+genOffset]}" ref="${refAuthors[i]}"`);
+                        console.log(`[DBG-Auth]   Author ${i+1} MISMATCH: gen="${effectiveGenAuthors[i+genOffset]}" ref="${refAuthors[i]}"`);
                         // Check if gen author appears anywhere in either known list (ordering vs fabrication)
-                        const foundElsewhere = allKnownAuthors.some(r => authorNamesMatch(genAuthors[i + genOffset], r));
+                        const foundElsewhere = allKnownAuthors.some(r => authorNamesMatch(effectiveGenAuthors[i + genOffset], r));
                         if (foundElsewhere) {
                             mismatchDetails.push(`Author ${i + 1} mismatch (found in different position).`);
                         } else {
@@ -576,8 +578,8 @@ export async function validateCitations(citations, apiKeys = {}) {
                 // c. Check count: flag if LLM listed MORE authors than actually exist
                 // diff >= 2 required: allow 1 author missing from DB (common data quality gap)
                 // (skip when refAuthors has only 1 entry — Scopus dc:creator is inherently incomplete)
-                if (refAuthors.length > 1 && genAuthors.length > refAuthors.length + 1) {
-                    mismatchDetails.push(`Author count: extracted ${genAuthors.length}, actual ${refAuthors.length}.`);
+                if (refAuthors.length > 1 && effectiveGenAuthors.length > refAuthors.length + 1) {
+                    mismatchDetails.push(`Author count: extracted ${effectiveGenAuthors.length}, actual ${refAuthors.length}.`);
                 }
             }
 
